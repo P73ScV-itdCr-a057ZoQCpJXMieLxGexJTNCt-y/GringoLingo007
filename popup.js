@@ -1,37 +1,40 @@
 // popup.js
 const fileInput = document.getElementById('fileInput');
 const analyzeBtn = document.getElementById('analyzeBtn');
-const statusEl = document.getElementById('status'); // Renamed to avoid clash with function
+const statusEl = document.getElementById('status');
 const extractedTextEl = document.getElementById('extractedText');
 const translatedTextEl = document.getElementById('translatedText');
 const summaryTextEl = document.getElementById('summaryText');
 const targetLangSelect = document.getElementById('targetLang');
 
-function setStatus(msg) { statusEl.textContent = msg; } // Changed to use statusEl
+function setStatus(msg) { statusEl.textContent = msg; }
 
 // --- LanguageModel (Prompt API) for OCR ---
-async function usePromptToExtractText(file) {
-  // Use LanguageModel (Prompt API) to accept an image and extract text
+
+// popup.js - The updated function definition
+
+async function usePromptToExtractText(file, outputLangCode) {
   if (!('LanguageModel' in window)) {
     throw new Error('LanguageModel (Prompt API) not available in this browser.');
   }
 
+  // Check availability
   const avail = await LanguageModel.availability();
   if (avail === 'unavailable') {
     throw new Error('LanguageModel unavailable on this device.');
   }
-
+  
   setStatus('Creating prompt session...');
-  // Note: The specific API shape (e.g., monitor, expectedInputs) is highly experimental
-  // We'll use a simpler, likely compatible setup for the Prompt API.
+  
+  // Create the session without speculative config, relying on the system prompt
   const session = await LanguageModel.create({
     expectedInputs: [{ type: 'image' }],
     initialPrompts: [
-      { role: 'system', content: 'You are an OCR and parser. Extract the visible textual content from the supplied image and return only the text in a clean format.' }
+      { role: 'system', content: `You are an OCR and parser. Extract the visible textual content from the supplied image.` }
     ]
   });
 
-  // Append the image file and the final instruction to the model
+  // Append the image file
   await session.append([
     {
       role: 'user',
@@ -42,14 +45,21 @@ async function usePromptToExtractText(file) {
   ]);
 
   setStatus('Prompting model to extract text...');
-  // Request the final output from the model
-  const promptResponse = await session.prompt('Return the extracted text.');
   
-  // The structure of the response might be a string directly, or an object.
-  // Assuming it returns a string for simplicity based on the goal.
+  // 💡 CRITICAL FIX: The output language is specified in the prompt options for attestation.
+  const promptResponse = await session.prompt(
+    // The final prompt instruction
+    `Return the extracted text in the language corresponding to the code: ${outputLangCode}.`, 
+    {
+      // Pass the language code in the dedicated options object for safety/quality checks
+      outputLanguage: outputLangCode 
+    }
+  );
+  
   return promptResponse;
 }
 
+// ... (The rest of popup.js remains the same)
 // --- Translator API ---
 async function translateText(sourceText, targetLang) {
   if (!('Translator' in window)) {
@@ -61,18 +71,16 @@ async function translateText(sourceText, targetLang) {
   if ('LanguageDetector' in window) {
     try {
       setStatus('Detecting source language...');
-      // LanguageDetector.detect may return a promise with { language, confidence }[]
+      // The LanguageDetector API structure is experimental, assume it returns a list of languages.
       const detected = await LanguageDetector.detect(sourceText);
-      if (detected && detected.length) {
+      if (detected && detected.length && detected[0].language) {
         sourceLang = detected[0].language; 
       }
     } catch (e) {
       console.warn('LanguageDetector failed', e);
-      // Fallback to 'auto' or a default like 'en'
     }
   }
 
-  // 'auto' may not be a valid explicit sourceLanguage for .create()
   // Use 'en' as a safe default if detection fails, or if the API doesn't support 'auto'
   const explicitSourceLang = sourceLang === 'auto' ? 'en' : sourceLang;
   
@@ -83,7 +91,6 @@ async function translateText(sourceText, targetLang) {
   });
 
   setStatus('Translating text...');
-  // The translate method is expected to return the translated string
   const translated = await translator.translate(sourceText);
   return translated;
 }
@@ -95,6 +102,13 @@ async function summarizeText(longText) {
     return '';
   }
 
+  // It's good practice to check availability, though we omit erroring out for summarization.
+  const avail = await Summarizer.availability();
+  if (avail === 'unavailable') {
+    console.warn('Summarizer not available on this device.');
+    return '';
+  }
+
   setStatus('Creating summarizer...');
   const summarizer = await Summarizer.create({
     type: 'key-points',
@@ -103,11 +117,11 @@ async function summarizeText(longText) {
   });
 
   setStatus('Summarizing...');
-  // The summarize method is expected to return the summary string
   const summary = await summarizer.summarize(longText, { context: 'Make this concise and actionable for a traveler.' });
   return summary;
 }
 
+// --- Main Handler ---
 // --- Main Handler ---
 analyzeBtn.addEventListener('click', async () => {
   try {
@@ -120,10 +134,13 @@ analyzeBtn.addEventListener('click', async () => {
     extractedTextEl.textContent = '';
     translatedTextEl.textContent = '';
     summaryTextEl.textContent = '';
+    
+    // Get the target language ONCE
+    const targetLang = targetLangSelect.value || 'en';
 
     // 1. Extract Text
     setStatus('Extracting text from image...');
-    const extracted = await usePromptToExtractText(file);
+    const extracted = await usePromptToExtractText(file, targetLang); 
     if (!extracted) {
       extractedTextEl.textContent = '(No text could be extracted)';
       setStatus('Done with error: No text extracted.');
@@ -132,7 +149,6 @@ analyzeBtn.addEventListener('click', async () => {
     extractedTextEl.textContent = extracted;
 
     // 2. Translate
-    const targetLang = targetLangSelect.value || 'en';
     setStatus(`Translating extracted text to ${targetLang}...`);
     const translated = await translateText(extracted, targetLang);
     translatedTextEl.textContent = translated;
@@ -145,8 +161,17 @@ analyzeBtn.addEventListener('click', async () => {
     setStatus('Done.');
   } catch (err) {
     console.error(err);
-    // Be careful with error messages as they can be large objects
-    setStatus('Error: ' + (err.message || String(err))); 
-    alert('Operation failed. See console for details.');
+    
+    // 💡 FIX: Handle DOMException explicitly, as it usually implies a security or system failure.
+    if (err instanceof DOMException) {
+      // Provide a more informative error message for the user.
+      const msg = `API Operation Blocked: ${err.name || 'DOMException'}. This usually means an on-device resource, security, or hardware restriction failed (check Chrome Flags).`;
+      setStatus('Error: ' + msg);
+      alert(msg);
+    } else {
+      // Handle all other errors
+      setStatus('Error: ' + (err.message || String(err))); 
+      alert('Operation failed. See console for details.');
+    }
   }
 });
